@@ -5,9 +5,9 @@
     Plugin.register('batch_group_exporter', {
         title: 'Batch Group Exporter',
         author: 'Gemini',
-        description: 'Exports all visible groups individually as files. Includes a settings window to configure scale, directory, and rotation handling.',
+        description: 'Exports all visible groups individually as files. Includes a settings window to configure scale, directory, rotation, and position handling.',
         icon: 'archive',
-        version: '1.2.0', // Bumped version for rotation handling options
+        version: '1.3.2', // Fixed memory leak/duplication bug caused by init()
         variant: 'desktop', 
         
         onload() {
@@ -24,7 +24,7 @@
             // Action to open settings window
             settingsAction = new Action('batch_export_settings', {
                 name: 'Batch Export Settings...',
-                description: 'Configure scale, output folder, and rotations for the Batch Group Exporter.',
+                description: 'Configure scale, output folder, position, and rotations for the Batch Group Exporter.',
                 icon: 'settings',
                 click: function() {
                     openSettings();
@@ -71,21 +71,19 @@
             return;
         }
         
-        // Migrate old v1.0.3 directory property if it exists
         if (Project.batch_export_dir && !Project.batch_export_config) {
-            Project.batch_export_config = { dir: Project.batch_export_dir, scale: 1, rotationMode: 'keep_all' };
+            Project.batch_export_config = { dir: Project.batch_export_dir, scale: 1, rotationMode: 'keep_all', positionMode: 'keep_original' };
             delete Project.batch_export_dir;
         }
 
-        // Migrate v1.1.1 resetRotation boolean to the new rotationMode string
         if (Project.batch_export_config && Project.batch_export_config.resetRotation !== undefined) {
             Project.batch_export_config.rotationMode = Project.batch_export_config.resetRotation ? 'reset_group' : 'keep_all';
             delete Project.batch_export_config.resetRotation;
         }
 
-        // Ensure config exists
-        Project.batch_export_config = Project.batch_export_config || { dir: '', scale: 1, rotationMode: 'keep_all' };
+        Project.batch_export_config = Project.batch_export_config || { dir: '', scale: 1, rotationMode: 'keep_all', positionMode: 'keep_original' };
         if (!Project.batch_export_config.rotationMode) Project.batch_export_config.rotationMode = 'keep_all';
+        if (!Project.batch_export_config.positionMode) Project.batch_export_config.positionMode = 'keep_original';
         
         let settingsDialog = new Dialog({
             id: 'batch_exporter_settings',
@@ -98,6 +96,16 @@
                     min: 0.001,
                     step: 0.1,
                     description: 'Changes the physical size of the exported meshes.'
+                },
+                positionMode: {
+                    label: 'Position Handling',
+                    type: 'select',
+                    options: {
+                        'keep_original': 'Keep Original Position (World coordinates)',
+                        'center_origin': 'Center to Origin (Moves group pivot to 0,0,0)'
+                    },
+                    value: Project.batch_export_config.positionMode,
+                    description: 'Should the exported meshes stay in their exact world location or center to the origin point?'
                 },
                 rotationMode: {
                     label: 'Rotation Handling',
@@ -120,6 +128,7 @@
             },
             onConfirm: function(formData) {
                 Project.batch_export_config.scale = parseFloat(formData.scale) || 1;
+                Project.batch_export_config.positionMode = formData.positionMode;
                 Project.batch_export_config.rotationMode = formData.rotationMode;
                 Project.batch_export_config.dir = formData.outDir;
                 this.hide();
@@ -147,27 +156,24 @@
         
         if (!Project) return;
 
-        // Migrate old v1.0.3 directory property if it exists
         if (Project.batch_export_dir && !Project.batch_export_config) {
-            Project.batch_export_config = { dir: Project.batch_export_dir, scale: 1, rotationMode: 'keep_all' };
+            Project.batch_export_config = { dir: Project.batch_export_dir, scale: 1, rotationMode: 'keep_all', positionMode: 'keep_original' };
             delete Project.batch_export_dir;
         }
-
-        // Migrate v1.1.1 resetRotation boolean to the new rotationMode string
         if (Project.batch_export_config && Project.batch_export_config.resetRotation !== undefined) {
             Project.batch_export_config.rotationMode = Project.batch_export_config.resetRotation ? 'reset_group' : 'keep_all';
             delete Project.batch_export_config.resetRotation;
         }
-
-        Project.batch_export_config = Project.batch_export_config || { dir: '', scale: 1, rotationMode: 'keep_all' };
+        Project.batch_export_config = Project.batch_export_config || { dir: '', scale: 1, rotationMode: 'keep_all', positionMode: 'keep_original' };
         if (!Project.batch_export_config.rotationMode) Project.batch_export_config.rotationMode = 'keep_all';
+        if (!Project.batch_export_config.positionMode) Project.batch_export_config.positionMode = 'keep_original';
         
         let savedDir = Project.batch_export_config.dir;
         let currentScale = Project.batch_export_config.scale;
+        let currentPosMode = Project.batch_export_config.positionMode;
         let currentRotMode = Project.batch_export_config.rotationMode;
         let needsPrompt = !savedDir || !fs.existsSync(savedDir);
 
-        // Helper function: Checks if an element AND all its parents are visible
         function isElementVisible(el) {
             if (el.visibility === false) return false;
             let parent = el.parent;
@@ -178,13 +184,10 @@
             return true;
         }
 
-        // 1. Collect groups to export based on rules
         let groupsToExport = [];
-        
         Group.all.forEach(group => {
             if (!isElementVisible(group)) return;
 
-            // Find direct children that are meshes/cubes (not folders) and are visible
             let directValidChildren = group.children.filter(child => {
                 let isFolder = child instanceof Group;
                 let isVisible = child.visibility !== false;
@@ -205,17 +208,24 @@
             return;
         }
 
-        // 2. Define the actual export execution logic
         function executeBatch(outDir) {
             console.log(`[BatchGroupExporter] Starting batch processing in directory: ${outDir}`);
             console.log(`[BatchGroupExporter] Using export scale multiplier: ${currentScale}`);
             console.log(`[BatchGroupExporter] Rotation handling mode: ${currentRotMode}`);
-            console.log("[BatchGroupExporter] Caching current visibility and export states...");
+            console.log(`[BatchGroupExporter] Position handling mode: ${currentPosMode}`);
             
-            // Cache both visibility AND export status so the OBJ compiler respects our filtering
+            // Safely collect all Outliner elements to avoid relying on visual hierarchy arrays
+            let allNodes = [];
+            if (typeof Group !== 'undefined' && Group.all) allNodes.push(...Group.all);
+            if (typeof Project !== 'undefined' && Project.elements) allNodes.push(...Project.elements);
+            else {
+                if (typeof Cube !== 'undefined' && Cube.all) allNodes.push(...Cube.all);
+                if (typeof Mesh !== 'undefined' && Mesh.all) allNodes.push(...Mesh.all);
+            }
+
+            // Global visibility and export cache
             let stateCache = new Map();
-            Outliner.elements.forEach(el => stateCache.set(el.uuid, { vis: el.visibility, exp: el.export }));
-            Group.all.forEach(g => stateCache.set(g.uuid, { vis: g.visibility, exp: g.export }));
+            allNodes.forEach(n => stateCache.set(n.uuid, { vis: n.visibility, exp: n.export }));
 
             let exportedCount = 0;
             let errors = 0;
@@ -230,17 +240,24 @@
                 let group = item.group;
                 let children = item.children;
                 
-                // Cache original rotations for this specific group's hierarchy to restore after compile
-                let originalRotations = new Map();
-                if (group.rotation) originalRotations.set(group.uuid, group.rotation.slice());
-                children.forEach(child => {
-                    if (child.rotation) originalRotations.set(child.uuid, child.rotation.slice());
-                });
+                // Deep cache transforms for this specific group's hierarchy to restore after compile
+                let localTransformCache = new Map();
+                function cacheNodeTransforms(n) {
+                    localTransformCache.set(n.uuid, {
+                        rot: n.rotation ? n.rotation.slice() : undefined,
+                        origin: n.origin ? n.origin.slice() : undefined,
+                        from: n.from ? n.from.slice() : undefined,
+                        to: n.to ? n.to.slice() : undefined,
+                        // Safely clone custom mesh vertices if present
+                        vertices: n.vertices ? JSON.parse(JSON.stringify(n.vertices)) : undefined
+                    });
+                    if (n.children) n.children.forEach(cacheNodeTransforms);
+                }
+                cacheNodeTransforms(group);
 
                 try {
-                    // Hide AND disable export for EVERYTHING
-                    Outliner.elements.forEach(el => { el.visibility = false; el.export = false; });
-                    Group.all.forEach(g => { g.visibility = false; g.export = false; });
+                    // Hide AND disable export for EVERYTHING globally
+                    allNodes.forEach(n => { n.visibility = false; n.export = false; });
 
                     // Reveal and enable export ONLY for this group's hierarchy and direct children
                     group.visibility = true;
@@ -256,41 +273,84 @@
                         child.export = true;
                     });
 
-                    // Option to neutralize rotation based on user settings
+                    // APPLY POSITION OFFSET: Center to origin mathematically
+                    if (currentPosMode === 'center_origin' && group.origin) {
+                        let offset = [-group.origin[0], -group.origin[1], -group.origin[2]];
+                        function shiftNode(n) {
+                            if (n.origin) n.origin = [n.origin[0] + offset[0], n.origin[1] + offset[1], n.origin[2] + offset[2]];
+                            if (n.from) n.from = [n.from[0] + offset[0], n.from[1] + offset[1], n.from[2] + offset[2]];
+                            if (n.to) n.to = [n.to[0] + offset[0], n.to[1] + offset[1], n.to[2] + offset[2]];
+                            
+                            // Adjust actual Mesh vertices if element is a custom Mesh (not a Cube)
+                            if (n.vertices) {
+                                for (let key in n.vertices) {
+                                    if (n.vertices[key] && n.vertices[key].length >= 3) {
+                                        n.vertices[key][0] += offset[0];
+                                        n.vertices[key][1] += offset[1];
+                                        n.vertices[key][2] += offset[2];
+                                    }
+                                }
+                            }
+                            if (n.children) n.children.forEach(shiftNode);
+                        }
+                        shiftNode(group);
+                    }
+
+                    // APPLY ROTATION OVERRIDES
                     if (currentRotMode === 'reset_group' || currentRotMode === 'reset_all') {
                         if (group.rotation) group.rotation = [0, 0, 0];
                     }
                     if (currentRotMode === 'reset_all') {
-                        children.forEach(child => {
-                            if (child.rotation) child.rotation = [0, 0, 0];
-                        });
+                        function unrotateNode(n) {
+                            if (n.rotation) n.rotation = [0, 0, 0];
+                            if (n.children) n.children.forEach(unrotateNode);
+                        }
+                        unrotateNode(group);
                     }
 
-                    // CRITICAL FIX: Force matrix update before compiling!
-                    // Without this, the compiler uses stale rotations from the previously rendered frame.
+                    // --- CRITICAL THREE.JS MATRICES UPDATE ---
                     Canvas.updateVisibility();
+                    
+                    // Push updated transformations to Blockbench's engine variables safely
+                    if (typeof Canvas.updateAllBones === 'function') Canvas.updateAllBones();
+                    if (typeof Canvas.updatePositions === 'function') Canvas.updatePositions();
+                    
+                    // Force the internal Three.js scene graph to immediately process the new math.
+                    if (Canvas.scene) {
+                        Canvas.scene.updateMatrixWorld(true);
+                    }
+                    // ------------------------------------------
 
                     console.log(`[BatchGroupExporter] Compiling OBJ for group '${group.name}'...`);
                     let content = Codecs.obj.compile();
 
-                    // Restore rotations immediately if we changed them
-                    if (originalRotations.has(group.uuid)) {
-                        group.rotation = originalRotations.get(group.uuid);
-                    }
-                    children.forEach(child => {
-                        if (originalRotations.has(child.uuid)) {
-                            child.rotation = originalRotations.get(child.uuid);
+                    // RESTORE TRANSFORMS IMMEDIATELY
+                    function restoreNodeTransforms(n) {
+                        if (localTransformCache.has(n.uuid)) {
+                            let state = localTransformCache.get(n.uuid);
+                            if (state.rot && n.rotation) n.rotation = state.rot.slice();
+                            if (state.origin && n.origin) n.origin = state.origin.slice();
+                            if (state.from && n.from) n.from = state.from.slice();
+                            if (state.to && n.to) n.to = state.to.slice();
+                            
+                            // Restore actual Mesh vertices
+                            if (state.vertices && n.vertices) {
+                                for (let key in state.vertices) {
+                                    if (n.vertices[key]) {
+                                        n.vertices[key][0] = state.vertices[key][0];
+                                        n.vertices[key][1] = state.vertices[key][1];
+                                        n.vertices[key][2] = state.vertices[key][2];
+                                    }
+                                }
+                            }
                         }
-                    });
-
-                    // Safely extract OBJ text data depending on codec output type
-                    let objData = typeof content === 'string' ? content : (content && content.obj ? content.obj : null);
-                    
-                    if (!objData) {
-                        throw new Error("Codec returned empty or invalid data.");
+                        if (n.children) n.children.forEach(restoreNodeTransforms);
                     }
+                    restoreNodeTransforms(group);
 
-                    // Apply the configured scale to the OBJ vertices
+                    let objData = typeof content === 'string' ? content : (content && content.obj ? content.obj : null);
+                    if (!objData) throw new Error("Codec returned empty or invalid data.");
+
                     objData = applyScaleToOBJ(objData, currentScale);
 
                     let safeName = group.name.replace(/[^a-zA-Z0-9_\-\ ]/gi, '_');
@@ -298,7 +358,6 @@
                     
                     let filePath = path.join(outDir, `${safeName}.obj`);
 
-                    // Write files
                     fs.writeFileSync(filePath, objData);
                     if (content && typeof content === 'object' && content.mtl) {
                         fs.writeFileSync(filePath.replace('.obj', '.mtl'), content.mtl);
@@ -313,23 +372,21 @@
                 }
             });
 
-            // Restore visibilities and export states
+            // Restore global visibilities and export states
             console.log("[BatchGroupExporter] Restoring workspace visibility and export states...");
-            Outliner.elements.forEach(el => {
-                if (stateCache.has(el.uuid)) {
-                    let state = stateCache.get(el.uuid);
-                    el.visibility = state.vis;
-                    el.export = state.exp;
+            allNodes.forEach(n => {
+                if (stateCache.has(n.uuid)) {
+                    let state = stateCache.get(n.uuid);
+                    n.visibility = state.vis;
+                    n.export = state.exp;
                 }
             });
-            Group.all.forEach(g => {
-                if (stateCache.has(g.uuid)) {
-                    let state = stateCache.get(g.uuid);
-                    g.visibility = state.vis;
-                    g.export = state.exp;
-                }
-            });
+            
+            // Final refresh of the workspace visual state safely
             Canvas.updateVisibility();
+            if (typeof Canvas.updateAllBones === 'function') Canvas.updateAllBones();
+            if (typeof Canvas.updatePositions === 'function') Canvas.updatePositions();
+            if (Canvas.scene) Canvas.scene.updateMatrixWorld(true);
 
             console.log(`[BatchGroupExporter] --- Process complete. Exported: ${exportedCount}, Errors: ${errors} ---`);
             Blockbench.showMessageBox({
@@ -338,14 +395,12 @@
             });
         }
 
-        // 3. Check if we need to prompt the user or skip straight to execution
         if (!needsPrompt) {
             console.log("[BatchGroupExporter] Using saved directory:", savedDir);
             executeBatch(savedDir);
             return;
         }
 
-        // 4. Ask the user for the destination directory
         try {
             const remote = require('@electron/remote');
             let dirPaths = remote.dialog.showOpenDialogSync({
@@ -358,7 +413,6 @@
                 return;
             }
             
-            // Save selection to the project so it persists in the .bbmodel save
             Project.batch_export_config.dir = dirPaths[0];
             executeBatch(dirPaths[0]);
 
@@ -378,12 +432,10 @@
                 
                 let outDir = path.dirname(filePath);
                 
-                // Clean up the dummy file Blockbench generated
                 try {
                     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
                 } catch(err) {}
                 
-                // Save selection to the project so it persists in the .bbmodel save
                 Project.batch_export_config.dir = outDir;
                 executeBatch(outDir);
             });
