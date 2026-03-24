@@ -1,0 +1,3 @@
+# Blockbench batch exporting
+
+This plugin exports each folder with it's direct children meshes as a separate .obj files.
