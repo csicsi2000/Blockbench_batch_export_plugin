@@ -5,9 +5,9 @@
     Plugin.register('batch_group_exporter', {
         title: 'Batch Group Exporter',
         author: 'Gemini',
-        description: 'Exports all visible groups individually as files. Settings are persistently saved per-project.',
+        description: 'Exports all visible groups individually as OBJ or FBX files. Settings are persistently saved per-project.',
         icon: 'archive',
-        version: '1.5.0', // Added export prefix option
+        version: '1.6.0', // Added FBX export option
         variant: 'desktop', 
         
         onload() {
@@ -24,7 +24,7 @@
             // Action to open settings window
             settingsAction = new Action('batch_export_settings', {
                 name: 'Batch Export Settings...',
-                description: 'Configure scale, output folder, prefix, position, and rotations for the Batch Group Exporter.',
+                description: 'Configure format, scale, output folder, prefix, position, and rotations for the Batch Group Exporter.',
                 icon: 'settings',
                 click: function() {
                     openSettings();
@@ -45,63 +45,231 @@
 
     // --- CONFIGURATION MANAGER ---
     // Uses LocalStorage to persist settings safely across app restarts and project reloads
+    const PROJECT_CONFIG_PREFIX = 'batch_exporter_cfg_';
+    const LAST_CONFIG_KEY = 'batch_exporter_cfg_last';
+
+    function getDefaultConfig() {
+        return { dir: '', scale: 1, rotationMode: 'keep_all', positionMode: 'keep_original', format: 'obj', prefix: '' };
+    }
+
+    function normalizeConfig(config) {
+        let normalized = Object.assign({}, getDefaultConfig(), config || {});
+        let scale = parseFloat(normalized.scale);
+        normalized.scale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+
+        if (normalized.positionMode === 'center_origin') normalized.positionMode = 'group_pivot';
+        if (normalized.resetRotation !== undefined) {
+            normalized.rotationMode = normalized.resetRotation ? 'reset_group' : 'keep_all';
+            delete normalized.resetRotation;
+        }
+        if (normalized.format !== 'fbx') normalized.format = 'obj';
+
+        return normalized;
+    }
+
+    function getProjectConfigKey() {
+        if (!Project || !Project.uuid) return null;
+        return PROJECT_CONFIG_PREFIX + Project.uuid;
+    }
+
     function getConfig() {
         if (!Project) return null;
-        
-        let defaultConfig = { dir: '', scale: 1, rotationMode: 'keep_all', positionMode: 'keep_original', prefix: '' };
+        let storageKey = getProjectConfigKey();
         
         // 1. Return current session config if it already exists
-        if (Project.batch_export_config) {
-            return Object.assign({}, defaultConfig, Project.batch_export_config);
+        if (Project.batch_export_config && Project.batch_export_config_key === storageKey) {
+            return normalizeConfig(Project.batch_export_config);
         }
         
         try {
             // 2. Try to load this specific project's saved config from the local database
-            let stored = localStorage.getItem('batch_exporter_cfg_' + Project.uuid);
-            if (stored) {
-                let parsed = JSON.parse(stored);
+            if (storageKey) {
+                let stored = localStorage.getItem(storageKey);
+                if (stored) {
+                    let parsed = normalizeConfig(JSON.parse(stored));
+                    Project.batch_export_config = parsed;
+                    Project.batch_export_config_key = storageKey;
+                    return normalizeConfig(parsed);
+                }
+            }
+
+            if (Project.batch_export_config && (!Project.batch_export_config_key || !storageKey)) {
+                let parsed = normalizeConfig(Project.batch_export_config);
                 Project.batch_export_config = parsed;
-                return Object.assign({}, defaultConfig, parsed);
+                Project.batch_export_config_key = storageKey;
+                return normalizeConfig(parsed);
             }
             
             // 3. Fallback: If this is a brand new project, use the last saved settings from OTHER projects,
             // but clear the directory so we don't accidentally overwrite files in another project's folder.
-            let globalStored = localStorage.getItem('batch_exporter_cfg_last');
+            let globalStored = localStorage.getItem(LAST_CONFIG_KEY);
             if (globalStored) {
-                let parsedGlobal = JSON.parse(globalStored);
+                let parsedGlobal = normalizeConfig(JSON.parse(globalStored));
                 parsedGlobal.dir = ''; // Clear directory for safety
                 Project.batch_export_config = parsedGlobal;
-                return Object.assign({}, defaultConfig, parsedGlobal);
+                Project.batch_export_config_key = storageKey;
+                return normalizeConfig(parsedGlobal);
             }
         } catch(e) {
             console.warn("[BatchGroupExporter] Failed to load config from storage:", e);
         }
 
         // 4. Ultimate fallback to default
+        let defaultConfig = getDefaultConfig();
         Project.batch_export_config = defaultConfig;
-        return defaultConfig;
+        Project.batch_export_config_key = storageKey;
+        return normalizeConfig(defaultConfig);
     }
 
     function saveConfig(config) {
         if (!Project) return;
-        
-        // Standardize legacy naming if present
-        if (config.positionMode === 'center_origin') config.positionMode = 'group_pivot';
-        if (config.resetRotation !== undefined) {
-            config.rotationMode = config.resetRotation ? 'reset_group' : 'keep_all';
-            delete config.resetRotation;
-        }
 
-        Project.batch_export_config = config;
+        let normalized = normalizeConfig(config);
+        let storageKey = getProjectConfigKey();
+
+        Project.batch_export_config = normalized;
+        Project.batch_export_config_key = storageKey;
         
         try {
             // Save specifically for this project
-            localStorage.setItem('batch_exporter_cfg_' + Project.uuid, JSON.stringify(config));
+            if (storageKey) {
+                localStorage.setItem(storageKey, JSON.stringify(normalized));
+            }
+
             // Save as global default for future new projects
-            localStorage.setItem('batch_exporter_cfg_last', JSON.stringify(config));
+            localStorage.setItem(LAST_CONFIG_KEY, JSON.stringify(Object.assign({}, normalized, { dir: '' })));
         } catch(e) {
             console.warn("[BatchGroupExporter] Failed to save config to storage:", e);
         }
+    }
+
+    function getExportScene() {
+        if (typeof scene !== 'undefined') return scene;
+        if (typeof Canvas !== 'undefined' && Canvas.scene) return Canvas.scene;
+        return null;
+    }
+
+    function getModelExportScale() {
+        try {
+            if (typeof Settings !== 'undefined' && Settings.get) {
+                let modelScale = parseFloat(Settings.get('model_export_scale'));
+                if (Number.isFinite(modelScale) && modelScale > 0) return modelScale;
+            }
+        } catch (e) {}
+
+        return 16;
+    }
+
+    function getFbxCompileOptions(scaleMultiplier) {
+        return {
+            encoding: 'ascii',
+            include_animations: false,
+            embed_textures: false,
+            scale: getModelExportScale() / scaleMultiplier
+        };
+    }
+
+    function findMatchingBrace(text, openBraceIndex) {
+        let depth = 0;
+        for (let i = openBraceIndex; i < text.length; i++) {
+            if (text[i] === '{') {
+                depth++;
+            } else if (text[i] === '}') {
+                depth--;
+                if (depth === 0) return i;
+            }
+        }
+        return -1;
+    }
+
+    function countFbxPolygons(geometryBlock) {
+        let match = geometryBlock.match(/PolygonVertexIndex:\s*\*\d+\s*\{[\s\S]*?\ba:\s*([^\r\n}]*)/);
+        if (!match) return 0;
+
+        return match[1]
+            .split(',')
+            .map(value => parseInt(value.trim(), 10))
+            .filter(value => Number.isFinite(value) && value < 0)
+            .length;
+    }
+
+    function insertFbxSmoothingLayerElement(geometryBlock, indent) {
+        let layerMatch = geometryBlock.match(/\n(\s*)Layer:\s*0\s*\{/);
+        if (!layerMatch) return geometryBlock;
+
+        let layerOpen = layerMatch.index + layerMatch[0].lastIndexOf('{');
+        let layerClose = findMatchingBrace(geometryBlock, layerOpen);
+        if (layerClose === -1) return geometryBlock;
+
+        let layerBlock = geometryBlock.slice(layerMatch.index, layerClose + 1);
+        let maxLayerElement = 0;
+        layerBlock.replace(/LayerElement(\d+):/g, function(match, index) {
+            maxLayerElement = Math.max(maxLayerElement, parseInt(index, 10));
+            return match;
+        });
+
+        let childIndent = layerMatch[1] + '\t';
+        let smoothingLayerElement = [
+            `${childIndent}LayerElement${maxLayerElement + 1}: {`,
+            `${childIndent}\tType: "LayerElementSmoothing"`,
+            `${childIndent}\tTypedIndex: 0`,
+            `${childIndent}}`
+        ].join('\n');
+
+        return geometryBlock.slice(0, layerClose)
+            + '\n' + smoothingLayerElement
+            + geometryBlock.slice(layerClose);
+    }
+
+    function addFbxSmoothingGroups(content) {
+        if (typeof content !== 'string' || content.includes('LayerElementSmoothing')) return content;
+
+        let output = '';
+        let cursor = 0;
+        let geometryPattern = /\n?(\s*)Geometry:\s*[^{}]*\{/g;
+        let match;
+
+        while ((match = geometryPattern.exec(content)) !== null) {
+            let blockStart = match.index + (match[0][0] === '\n' ? 1 : 0);
+            let openBrace = geometryPattern.lastIndex - 1;
+            let blockEnd = findMatchingBrace(content, openBrace);
+            if (blockEnd === -1) break;
+
+            let block = content.slice(blockStart, blockEnd + 1);
+            let polygonCount = countFbxPolygons(block);
+            if (polygonCount > 0 && !block.includes('LayerElementSmoothing')) {
+                let indent = match[1];
+                let childIndent = indent + '\t';
+                let isSmoothNormalLayer = /LayerElementNormal:[\s\S]*?MappingInformationType:\s*"ByVertex"/.test(block);
+                let smoothingValue = isSmoothNormalLayer ? 1 : 0;
+                let smoothingValues = Array(polygonCount).fill(smoothingValue).join(',');
+                let smoothingBlock = [
+                    `${childIndent}LayerElementSmoothing: 0 {`,
+                    `${childIndent}\tVersion: 102`,
+                    `${childIndent}\tName: ""`,
+                    `${childIndent}\tMappingInformationType: "ByPolygon"`,
+                    `${childIndent}\tReferenceInformationType: "Direct"`,
+                    `${childIndent}\tSmoothing: *${polygonCount} {`,
+                    `${childIndent}\t\ta: ${smoothingValues}`,
+                    `${childIndent}\t}`,
+                    `${childIndent}}`
+                ].join('\n');
+
+                let layerIndex = block.search(/\n\s*Layer:\s*0\s*\{/);
+                if (layerIndex !== -1) {
+                    block = block.slice(0, layerIndex)
+                        + '\n' + smoothingBlock
+                        + block.slice(layerIndex);
+                    block = insertFbxSmoothingLayerElement(block, indent);
+                }
+            }
+
+            output += content.slice(cursor, blockStart) + block;
+            cursor = blockEnd + 1;
+            geometryPattern.lastIndex = cursor;
+        }
+
+        return output + content.slice(cursor);
     }
     // -----------------------------
 
@@ -167,6 +335,16 @@
                     value: cfg.rotationMode,
                     description: 'How to handle rotations. "Keep All" maintains Blockbench orientation.'
                 },
+                exportFormat: {
+                    label: 'Export Format',
+                    type: 'select',
+                    options: {
+                        'obj': 'OBJ (.obj + .mtl)',
+                        'fbx': 'FBX ASCII (.fbx)'
+                    },
+                    value: cfg.format,
+                    description: 'FBX ASCII is recommended for Unreal Engine static mesh import.'
+                },
                 prefix: {
                     label: 'Export Filename Prefix',
                     type: 'text',
@@ -179,7 +357,7 @@
                     type: 'text',
                     value: cfg.dir,
                     placeholder: 'Leave blank to be prompted during export...',
-                    description: 'The target folder for the .obj files.'
+                    description: 'The target folder for the exported group files.'
                 }
             },
             onConfirm: function(formData) {
@@ -187,6 +365,7 @@
                     scale: parseFloat(formData.scale) || 1,
                     positionMode: formData.positionMode,
                     rotationMode: formData.rotationMode,
+                    format: formData.exportFormat,
                     prefix: formData.prefix || '',
                     dir: formData.outDir
                 };
@@ -221,6 +400,7 @@
         let currentScale = cfg.scale;
         let currentPosMode = cfg.positionMode;
         let currentRotMode = cfg.rotationMode;
+        let currentFormat = cfg.format;
         let currentPrefix = cfg.prefix || '';
         let needsPrompt = !savedDir || !fs.existsSync(savedDir);
 
@@ -263,7 +443,11 @@
             console.log(`[BatchGroupExporter] Using export scale multiplier: ${currentScale}`);
             console.log(`[BatchGroupExporter] Rotation handling mode: ${currentRotMode}`);
             console.log(`[BatchGroupExporter] Position handling mode: ${currentPosMode}`);
+            console.log(`[BatchGroupExporter] Export format: ${currentFormat}`);
             console.log(`[BatchGroupExporter] Using prefix: '${currentPrefix}'`);
+            const exportScene = getExportScene();
+            const codec = Codecs[currentFormat];
+            const extension = currentFormat === 'fbx' ? 'fbx' : 'obj';
             
             // Safely collect all Outliner elements to avoid relying on visual hierarchy arrays
             let allNodes = [];
@@ -281,9 +465,10 @@
             let exportedCount = 0;
             let errors = 0;
 
-            if (!Codecs.obj) {
-                console.error("[BatchGroupExporter] OBJ Codec not found for this project type.");
-                Blockbench.showMessageBox({ title: 'Format Error', message: 'OBJ exporting is not available in this workspace format.'});
+            if (!codec) {
+                let formatName = currentFormat.toUpperCase();
+                console.error(`[BatchGroupExporter] ${formatName} Codec not found for this project type.`);
+                Blockbench.showMessageBox({ title: 'Format Error', message: `${formatName} exporting is not available in this workspace format.`});
                 return;
             }
 
@@ -311,6 +496,7 @@
 
                     // Initial geometry update to ensure the matrices reflect current BB visual state
                     Canvas.updateVisibility();
+                    if (exportScene) exportScene.updateMatrixWorld(true);
 
                     // DIRECT THREE.JS MANIPULATION CACHE
                     let threeCache = new Map();
@@ -328,15 +514,17 @@
                     cacheThree(group);
 
                     // ISOLATE AND MODIFY THREE.JS MATRICES
-                    if (group.mesh && typeof THREE !== 'undefined' && Canvas.scene) {
+                    if (group.mesh && typeof THREE !== 'undefined' && exportScene) {
                         // Ensure world matrices are up to date before grabbing coordinates
                         group.mesh.updateMatrixWorld(true);
                         let worldPos = new THREE.Vector3();
+                        let worldQuat = new THREE.Quaternion();
                         group.mesh.getWorldPosition(worldPos);
-                        
+                        group.mesh.getWorldQuaternion(worldQuat);
+
                         // Temporarily isolate group to the root of the Scene to decouple it from parent transforms
-                        Canvas.scene.add(group.mesh);
-                        
+                        exportScene.add(group.mesh);
+
                         // POSITION OVERRIDE
                         if (currentPosMode === 'group_pivot') {
                             // Being parented directly to the scene means 0,0,0 sets the pivot directly to the world origin
@@ -347,8 +535,9 @@
 
                         // ROTATION OVERRIDES
                         if (currentRotMode === 'reset_group' || currentRotMode === 'reset_all') {
-                            group.mesh.rotation.set(0, 0, 0);
                             group.mesh.quaternion.set(0, 0, 0, 1);
+                        } else {
+                            group.mesh.quaternion.copy(worldQuat);
                         }
                     }
 
@@ -366,8 +555,10 @@
                     // Force the Three.js scene graph to process the new math so the compiler sees it
                     if (group.mesh) group.mesh.updateMatrixWorld(true);
 
-                    console.log(`[BatchGroupExporter] Compiling OBJ for group '${group.name}'...`);
-                    let content = Codecs.obj.compile();
+                    console.log(`[BatchGroupExporter] Compiling ${currentFormat.toUpperCase()} for group '${group.name}'...`);
+                    let content = currentFormat === 'fbx'
+                        ? codec.compile(getFbxCompileOptions(currentScale))
+                        : codec.compile({ all_files: true });
 
                     // RESTORE THREE.JS CACHE IMMEDIATELY
                     function restoreThree(n) {
@@ -383,22 +574,26 @@
                     }
                     restoreThree(group);
 
-                    // Extract the compiled OBJ data safely
-                    let objData = typeof content === 'string' ? content : (content && content.obj ? content.obj : null);
-                    if (!objData) throw new Error("Codec returned empty or invalid data.");
+                    let outputData = typeof content === 'string' || content instanceof Uint8Array
+                        ? content
+                        : (content && content.obj ? content.obj : null);
+                    if (!outputData) throw new Error("Codec returned empty or invalid data.");
 
-                    // Apply the configured scale multiplier
-                    objData = applyScaleToOBJ(objData, currentScale);
+                    if (currentFormat === 'obj') {
+                        outputData = applyScaleToOBJ(outputData, currentScale);
+                    } else if (currentFormat === 'fbx') {
+                        outputData = addFbxSmoothingGroups(outputData);
+                    }
 
                     // Prepend the prefix and sanitize the final filename
                     let rawName = currentPrefix + group.name;
                     let safeName = rawName.replace(/[^a-zA-Z0-9_\-\ ]/gi, '_');
                     if (!safeName || safeName.trim() === "") safeName = 'group_' + group.uuid.substring(0, 5);
                     
-                    let filePath = path.join(outDir, `${safeName}.obj`);
+                    let filePath = path.join(outDir, `${safeName}.${extension}`);
 
-                    fs.writeFileSync(filePath, objData);
-                    if (content && typeof content === 'object' && content.mtl) {
+                    fs.writeFileSync(filePath, outputData);
+                    if (currentFormat === 'obj' && content && typeof content === 'object' && content.mtl) {
                         fs.writeFileSync(filePath.replace('.obj', '.mtl'), content.mtl);
                     }
 
@@ -422,12 +617,12 @@
             });
             
             Canvas.updateVisibility();
-            if (Canvas.scene) Canvas.scene.updateMatrixWorld(true);
+            if (exportScene) exportScene.updateMatrixWorld(true);
 
             console.log(`[BatchGroupExporter] --- Process complete. Exported: ${exportedCount}, Errors: ${errors} ---`);
             Blockbench.showMessageBox({
                 title: 'Batch Export Complete',
-                message: `Successfully exported ${exportedCount} groups to:\n${outDir}\n\nScale applied: x${currentScale}\nErrors encountered: ${errors}\n\n(Press Ctrl+Shift+I and check the console for logs)`
+                message: `Successfully exported ${exportedCount} groups to:\n${outDir}\n\nFormat: ${currentFormat.toUpperCase()}\nScale applied: x${currentScale}\nErrors encountered: ${errors}\n\n(Press Ctrl+Shift+I and check the console for logs)`
             });
         }
 
@@ -457,9 +652,9 @@
             console.warn("[BatchGroupExporter] Native dialog failed. Falling back to Blockbench Export UI.", e);
             
             Blockbench.export({
-                type: 'Batch Target Directory',
-                extensions: ['obj'],
-                name: 'Save_Here_To_Select_Folder',
+                type: `Batch Target Directory (${currentFormat.toUpperCase()})`,
+                extensions: [currentFormat],
+                name: `Save_Here_To_Select_Folder.${currentFormat}`,
                 content: 'dummy_content_to_prevent_error' 
             }, function(filePath) {
                 if (!filePath) {
